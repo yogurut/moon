@@ -1,0 +1,39 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 0点 / 12点（北京时间 8点 / 20点）自动拉取上游同步
+    - cron: '0 0,12 * * *'
+  workflow_dispatch: # 支持在 GitHub 页面上点一下手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync with Upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 添加上游仓库
+          git remote add upstream https://github.com/AnkioTomas/moon.git || true
+          git fetch upstream main
+          
+          # 合并上游 main 分支
+          echo "Merging upstream/main into main..."
+          git merge --no-edit upstream/main || {
+            echo "Conflict detected, aborting auto merge. Please resolve manually."
+            exit 1
+          }
+          
+          # 推送到自己的仓库
+          git push origin main
