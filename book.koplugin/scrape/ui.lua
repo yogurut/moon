@@ -1,7 +1,7 @@
 --[[--
 刮削 UI 流程
 
-用户确认书名 -> 搜索 -> 选择结果 -> 写 books 表 + 下封面 -> 通知调用方刷新
+用户确认书名 -> 搜索 -> 选择结果 -> 写 books 表 + 下封面 -> 通知属主源上行 -> 通知调用方刷新
 
 @module koplugin.book.scrape.ui
 --]]
@@ -22,50 +22,8 @@ local T = require("ffi/util").template
 
 local ScrapeUI = {}
 
---- 原样复制文件（先写 .part 再改名，避免半截封面被读到）。
----@param from string
----@param to string
----@return boolean|nil ok
----@return string|nil err
-local function copyFile(from, to)
-    local src, oerr = io.open(from, "rb")
-    if not src then
-        return nil, oerr
-    end
-    local tmp = to .. ".part"
-    pcall(os.remove, tmp)
-    local dst, derr = io.open(tmp, "wb")
-    if not dst then
-        src:close()
-        return nil, derr
-    end
-
-    local err
-    while true do
-        local chunk, rerr = src:read(64 * 1024)
-        if not chunk then
-            err = rerr
-            break
-        end
-        local wok, werr = dst:write(chunk)
-        if not wok then
-            err = werr or "write failed"
-            break
-        end
-    end
-    src:close()
-    local cok, cerr = dst:close()
-    if not cok and not err then err = cerr or "close failed" end
-    if not err then
-        local rok, mverr = os.rename(tmp, to)
-        if rok then return true end
-        err = mverr or "rename failed"
-    end
-    os.remove(tmp)
-    return nil, err
-end
-
---- 下载封面并落进本源封面缓存；books 表不存链接，UI 只认本地文件。
+--- 换封面：先删旧封面，新图下载后移入本源封面缓存；books 表不存链接，UI 只认本地文件。
+--- 结果没有封面时保留旧封面；下载失败则无封面，local 下次扫盘会从书内重新提取。
 ---@param identity BookIdentity
 ---@param url string
 ---@param headers table|nil 源站防盗链头（豆瓣必须带 Referer）
@@ -75,14 +33,19 @@ local function saveCover(identity, url, headers, done)
         done()
         return
     end
+    local target = Paths.coverPath(identity.stable_id, identity.source_id)
+    os.remove(target)
+    Image.invalidate(target)
     Image.fetchAsync(url, headers, function(path, err)
-        if path then
-            local ok, cerr = copyFile(path, Paths.coverPath(identity.stable_id, identity.source_id))
-            if not ok then
-                logger.warn("scrape cover save failed:", path, cerr)
-            end
-        else
+        if not path then
             logger.warn("scrape cover download failed:", url, err)
+            done()
+            return
+        end
+        Paths.ensureLayout(identity.source_id)
+        local ok, merr = os.rename(path, target)
+        if not ok then
+            logger.warn("scrape cover save failed:", path, merr)
         end
         done()
     end)
@@ -109,7 +72,13 @@ local function applyResult(identity, result, done)
         done(_("元数据更新失败"))
         return
     end
-    saveCover(identity, result.cover_url, result.cover_headers, done)
+    saveCover(identity, result.cover_url, result.cover_headers, function()
+        require("source.registry").resolve(identity.source_id):onEvent("book_meta_changed", {
+            identity = identity,
+            cover = result.cover_url ~= "",
+        })
+        done()
+    end)
 end
 
 --- 显示搜索结果选择页

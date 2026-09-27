@@ -24,11 +24,12 @@
 UI 图标请用 ui.components.icon（Material Icons 字体），不要走本组件。
 
   Image.fetchAsync(url, headers, function(path, err) end)  -- 只下载不显示（刮削封面）
+  Image.invalidate(path)  -- 原地替换过的文件，之后绕过按路径的位图缓存
   Image.await(root, cb)  -- 已构建树内的图片落定后回调（锁屏写 PNG）
   box:cancel()  -- 只取消这一张的下载
 
 下载单独限流。解码走 ImageWidget（file=，自带 BB 缓存），不 fork。
-小图（目标面积且文件都小）当场解；封面这种大图排队，解一张让出一次输入轮询。
+小图（目标面积且文件都小）当场解；封面这种大图排队，每拍按时间预算连续解，超预算才让出输入轮询。
 
 @module koplugin.book.ui.components.image
 --]]
@@ -43,6 +44,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local TextWidget = require("ui/widget/textwidget")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("utils.log")
+local Perf = require("utils.perf")
 local Text = require("utils.text")
 local UI = require("ui.components.bookui")
 local Download = require("ui.components.image.download")
@@ -50,6 +52,16 @@ local ImageWidget = require("ui/widget/imagewidget")
 
 ---@class BookImage
 local Image = {}
+
+-- 本会话内被原地替换过的文件。ImageWidget 的位图缓存只按路径+尺寸寻址，
+-- 同路径换了内容仍会命中旧图，这些路径必须自己解码绕过缓存。
+local replaced = {}
+
+--- 标记文件内容已被替换（刮削换封面），之后显示该路径不再命中旧位图。
+---@param path string
+function Image.invalidate(path)
+    replaced[path] = true
+end
 
 ---- 等待一棵已构建 Widget 树内的图片落定。批次归调用者，不拦截全局构建。
 --- 取消只移除本批监听；图片任务由拥有 Widget 的视图释放。
@@ -192,6 +204,8 @@ end
 -- 小图：天气图标级别。超过任一阈值就排队，避免图书馆一页 12 张封面卡死拼页。
 local SMALL_PIXELS = 80 * 80
 local SMALL_BYTES = 32 * 1024
+-- 每拍解码预算：预算内连续解（ImageCache 命中几乎零耗时，一拍出齐），超了才让出。
+local BUDGET_MS = 50
 -- UIManager 在任务队列变脏时会反复跑任务、不去读输入；续排必须晚于一次重绘，才能让出输入轮询。
 local YIELD_S = 0.1
 
@@ -212,21 +226,20 @@ local function cheap(path, w, h)
     return size <= SMALL_BYTES
 end
 
---- 跳过失效图片任务，每个 UI tick 最多解码一张仍存活的排队图片。
+--- 跳过失效图片任务；一个 UI tick 内按 BUDGET_MS 连续解码，超预算再续排。
 local function pump()
     pumping = false
+    local started = Perf.now()
     while wait[1] do
         local item = table.remove(wait, 1)
         local box = item.box
-        if not box._alive then
-            box:_settle()
-        else
+        if box._alive then
             box:_applyFile(item.path)
-            box:_settle()
-            if wait[1] then
-                pumping = true
-                UIManager:scheduleIn(YIELD_S, pump)
-            end
+        end
+        box:_settle()
+        if wait[1] and Perf.now() - started >= BUDGET_MS then
+            pumping = true
+            UIManager:scheduleIn(YIELD_S, pump)
             return
         end
     end
@@ -370,8 +383,12 @@ local function asyncBox(src, headers, w, h, alpha, border, fb, show_parent, on_r
     function box:_applyFile(path)
         local widget
         local ok, err = pcall(function()
+            local fresh = replaced[path]
+                and assert(require("ui/renderimage"):renderImageFile(path, false, self._inner_w, self._inner_h))
             widget = ImageWidget:new{
-                file = path,
+                file = not fresh and path or nil,
+                image = fresh or nil,
+                image_disposable = true,
                 width = self._inner_w,
                 height = self._inner_h,
                 alpha = self._alpha and true or false,

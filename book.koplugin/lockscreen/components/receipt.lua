@@ -82,9 +82,10 @@ end
 
 --- 阅读票根：日期 → 当前书 → 进度/时长 → 今日摘要 → 装饰条码。
 ---@param rect table
+---@param book table|nil 指定书籍快照（Current.snapshot），缺省取当前源最近在读
 ---@return table[]
-function M.blocks(rect)
-    local book = Current.book(true)
+function M.blocks(rect, book)
+    book = book or Current.book(true)
     if not book then
         return U.emptyBlocks(rect, _("阅读票根"), _("当前没有正在阅读的书籍"))
     end
@@ -115,6 +116,11 @@ function M.blocks(rect)
     local logo_y = y + pad
     local brand_x = x + logo_size + math.floor(pad * 0.6)
     local brand_y = logo_y + math.floor((logo_size - 16) / 2)
+    -- 标题从 logo 下按像素排，字高随屏幕缩放：轨迹行和分隔线跟着实测字高顺排，不按面板比例，否则互相压字
+    local heading_y = logo_y + logo_size + 5
+    local track_text = _("今日阅读轨迹") .. "  ·  " .. os.date("%Y.%m.%d")
+    local track_y = heading_y + Render.measureText("READ RECEIPT", width, 27, true)
+    local rule_y = math.max(y + math.floor(height * 0.17), track_y + Render.measureText(track_text, width, 14) + 4)
     local blocks = {
         {
             kind = "panel", x = rect.x, y = y, width = rect.w, height = height,
@@ -131,7 +137,7 @@ function M.blocks(rect)
             box = false, color = U.MUTED,
         },
         {
-            text = "READ RECEIPT", x = x, y = logo_y + logo_size + 5,
+            text = "READ RECEIPT", x = x, y = heading_y,
             width = width, size = 27, bold = true, box = false,
         },
         {
@@ -140,11 +146,10 @@ function M.blocks(rect)
             box = false, color = U.MUTED,
         },
         {
-            text = _("今日阅读轨迹") .. "  ·  " .. os.date("%Y.%m.%d"),
-            x = x, y = y + math.floor(height * 0.125),
+            text = track_text, x = x, y = track_y,
             width = width, size = 14, box = false, color = U.MUTED,
         },
-        { kind = "rule", x = x, y = y + math.floor(height * 0.17), width = width, height = 1, color = U.RULE },
+        { kind = "rule", x = x, y = rule_y, width = width, height = 1, color = U.RULE },
         {
             text = _("当前阅读"), x = x, y = y + math.floor(height * 0.195),
             width = info_w, size = 14, bold = true, box = false,

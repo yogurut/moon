@@ -44,6 +44,12 @@ local function isOpenOnStart()
     return G_reader_settings:readSetting("start_with", "filemanager") == Host.OPEN_ON_START_ID
 end
 
+--- 顶部菜单抽屉（文件浏览器）图标是否改开月读桌面：启动项为月读且设置未关闭。
+---@return boolean
+function Host.drawerOpensDesktop()
+    return isOpenOnStart() and require("utils.settings").get().drawer_opens_desktop == true
+end
+
 --- 首次安装（尚未种过）时强制 start_with=月读，不跟系统默认 filemanager。
 --- 只跑一次；之后设置里「启动打开桌面」或系统启动项由用户自己改。
 local function seedStartWithOnInstall()
@@ -85,6 +91,12 @@ local function registerMenu(plugin)
             category = "none",
             event = "BookXrayRefresh",
             title = _("刷新 X-Ray"),
+            reader = true,
+        })
+        Dispatcher:registerAction("book_reader_sidebar", {
+            category = "none",
+            event = "BookReaderSidebar",
+            title = _("打开月读侧栏"),
             reader = true,
         })
     end

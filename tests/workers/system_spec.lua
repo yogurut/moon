@@ -52,7 +52,8 @@ local util = {
     pending = "",
     alive = true,
     run = function()
-        return 7, 3
+        -- Job 收尾会真的 close(read_fd)：用必然未打开的号，别关掉 runner 进程里的真实 fd
+        return 7, 4095
     end,
 }
 package.preload["ffi/util"] = function()
@@ -78,7 +79,7 @@ package.preload["ffi/posix"] = function()
         read = function(_, buffer, size)
             local n = math.min(#util.pending, size)
             if n > 0 then
-                ffi.copy(buffer, util.pending:sub(1, n))
+                ffi.copy(buffer, util.pending, n)
                 util.pending = util.pending:sub(n + 1)
             end
             return n

@@ -75,6 +75,20 @@ local function bootstrapReading(plugin, session, skip_pull)
     require("book.note").pull(plugin.ui, session.identity)
 end
 
+--- 整书用已打开的文档补本地封面：云端没封面的书下载后靠它显示（书架/详情/锁屏认这个文件）。
+--- 放到下一拍不拖首绘；已有封面直接跳过，文档已换掉就放弃。
+---@param ui table
+---@param identity BookIdentity
+local function ensureCover(ui, identity)
+    local doc = ui.document
+    require("ui/uimanager"):nextTick(function()
+        if ui.document ~= doc then return end
+        local Paths = require("utils.paths")
+        Paths.ensureLayout(identity.source_id)
+        require("book.cover").save(doc, Paths.coverPath(identity.stable_id, identity.source_id))
+    end)
+end
+
 --- 当前阅读快照；调用方只读，不得修改其字段。
 ---@return ReaderSessionSnapshot|nil
 function Session.current()
@@ -150,6 +164,7 @@ function Session.onReaderReady(plugin)
         ChapterMode.clearActiveChapter(Session._snapshot)
         Snapshot.refresh(Session._snapshot)
         require("ui.reader.session.auto_toc").start(Session._snapshot)
+        ensureCover(ui, identity)
     end
     updateReadState(Session._snapshot)
     bootstrapReading(plugin, Session._snapshot, skip_pull)
@@ -242,7 +257,7 @@ function Session.onPageChanged(plugin, page)
     end
 end
 
---- 注解变化：落盘后有网即 dirty push；完整 pull 留给开书 Note.pull。
+--- 注解变化：落盘后已在线才 dirty push；离线留脏给 Sync.retryDirtyAsync，不弹联网提示。
 ---@param plugin table Book 插件实例
 ---@param _items table KOReader 变更描述；完整数据从 annotation.annotations 读取
 function Session.onAnnotationsModified(plugin, _items)
@@ -252,9 +267,8 @@ function Session.onAnnotationsModified(plugin, _items)
         if not ok then return end
         local source = identity and identity.source
         if not source or not source.syncNotesAsync then return end
-        require("ui/network/manager"):runWhenOnline(function()
-            source:syncNotesAsync({ identity = identity, dirty_only = true }, function() end)
-        end)
+        if not require("ui/network/manager"):isOnline() then return end
+        source:syncNotesAsync({ identity = identity, dirty_only = true }, function() end)
     end)
 end
 

@@ -66,10 +66,10 @@ end
 
 --- 当前源最近打开的书，优先取未读完的那本。
 --- 元数据来自 books，阅读位置来自 pending_progress。
+--- 混合模式下 scope 是源 id 列表，书的源必须取行内 source_id。
 ---@return table|nil 书库为空时 nil
 local function currentBook()
-    local source_id = Library.activeSourceId()
-    local recent = Catalog.recentBooks(source_id, 16)
+    local recent = Catalog.recentBooks(Library.activeSourceId(), 16)
     if #recent == 0 then return nil end
     local row
     for _, book in ipairs(recent) do
@@ -80,7 +80,7 @@ local function currentBook()
     end
     row = row or recent[1]
     return buildBook{
-        source_id = source_id,
+        source_id = row.source_id,
         stable_id = row.stable_id,
         title = row.title,
         authors = row.authors,
@@ -99,6 +99,13 @@ end
 function M.book(with_stats)
     local book = currentBook()
     return with_stats and withStats(book) or book
+end
+
+--- 指定书的带统计快照（阅读页侧栏票根用：书跟阅读身份走，不取「当前源最近在读」）。
+---@param fields table source_id/stable_id/title/authors/percent/page/total_pages/chapter_*
+---@return table
+function M.snapshot(fields)
+    return withStats(buildBook(fields))
 end
 
 --- 当前阅读主体：白卡贴合 BookInfo.hero 高度（封面 / 书名 / 作者 / 章节 / 进度）。

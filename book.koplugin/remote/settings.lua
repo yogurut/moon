@@ -2,7 +2,7 @@
 远程配置：白名单读写（连接类设置在浏览器填写）。
 
 GET 脱敏密钥；POST 里保留占位符 "******" 表示不修改该字段。
-全部经 utils.settings 落盘，副作用（registry.invalidate、zlib 清会话）与设备设置一致。
+全部经 utils.settings 落盘，副作用（registry.invalidate、zlib 清会话、OPDS 重算底栏）与设备设置一致。
 
 @module koplugin.book.remote.settings
 --]]
@@ -19,6 +19,7 @@ local SECRET_KEYS = {
     ai_api_key = true,
     token = true,
     password = true,
+    webdav_password = true,
 }
 
 --- 密钥脱敏：空值回空串，否则一律占位符。
@@ -66,6 +67,8 @@ function SettingsApi.snapshot()
     local moon = Settings.getSource("moon")
     local copymanga = Settings.getSource("copymanga") or {}
     local zlib = Settings.getSource("zlib")
+    local opds = Settings.getSource("opds")
+    local localSource = Settings.getSource("local")
     return {
         ai = {
             ai_endpoint = asStr(ai.ai_endpoint),
@@ -85,6 +88,17 @@ function SettingsApi.snapshot()
             email = asStr(zlib.email),
             password = maskValue(zlib.password),
             base_url = asStr(zlib.base_url),
+        },
+        opds = {
+            url = asStr(opds.url),
+            username = asStr(opds.username),
+            password = maskValue(opds.password),
+        },
+        ["local"] = {
+            webdav_url = asStr(localSource.webdav_url),
+            webdav_username = asStr(localSource.webdav_username),
+            webdav_password = maskValue(localSource.webdav_password),
+            webdav_path = asStr(localSource.webdav_path),
         },
     }
 end
@@ -147,6 +161,21 @@ function SettingsApi.apply(payload)
         end
     end
 
+    if type(payload.opds) == "table" then
+        local cfg = Settings.getSource("opds")
+        local g = payload.opds
+        --- 缺省键保持原值；密码占位符同样表示不改。
+        local function pick(key)
+            if g[key] == nil or (SECRET_KEYS[key] and g[key] == SettingsApi.MASK) then return cfg[key] end
+            return tostring(g[key])
+        end
+        if require("opds.setting").save(pick("url"), pick("username"), pick("password")) then
+            -- 地址空/非空决定底栏有没有 OPDS 页签；与设备对话框一样走 onSourceChanged 重算。
+            require("ui/uimanager"):broadcastEvent(require("ui/event"):new("SourceChanged"))
+            changed = true
+        end
+    end
+
     if type(payload.copymanga) == "table" then
         local cfg = Settings.getSource("copymanga") or {}
         local g = payload.copymanga
@@ -156,6 +185,20 @@ function SettingsApi.apply(payload)
         if changed_group then
             -- Credentials and endpoint affect the active client/session.
             Settings.saveSource("copymanga", cfg)
+            require("source.registry").invalidate()
+            changed = true
+        end
+    end
+
+    if type(payload["local"]) == "table" then
+        local cfg = Settings.getSource("local")
+        local g = payload["local"]
+        local local_changed = false
+        for _, key in ipairs({ "webdav_url", "webdav_username", "webdav_password", "webdav_path" }) do
+            local_changed = applyField(cfg, key, g[key], Text.trim) or local_changed
+        end
+        if local_changed then
+            Settings.saveSource("local", cfg)
             require("source.registry").invalidate()
             changed = true
         end

@@ -163,7 +163,7 @@ end
 ---@param bt table 底部 Tab 的项目、选中值和切换回调
 local function attachBottomTabs(menu, bt)
     local BottomBar = require("ui.views.bottombar")
-    local view = BottomBar:new{ host = menu, data = {
+    local view = BottomBar:new{ host = menu, width = menu.inner_dimen.w, data = {
         tabs = bt.tabs or {}, active = bt.active,
         on_tab = function(id)
             if id ~= bt.active and bt.on_tab then bt.on_tab(id) end
@@ -204,7 +204,7 @@ local function attachBottomTabs(menu, bt)
         view.data.active = id
         view:updateView(view.data)
         stack:resetLayout()
-        UIManager:setDirty(self, "ui")
+        UIManager:setDirty(self.show_parent, "ui")
     end
     menu:updateItems() -- 触发一次全量重算，让上面的补扣生效
 end

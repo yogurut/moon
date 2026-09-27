@@ -53,10 +53,18 @@ package.preload["ffi/blitbuffer"] = function()
     return { COLOR_WHITE = 0 }
 end
 
+-- 假时钟：每次解码推进 decode_ms，模拟设备上的解码耗时。
+local now_ms, decode_ms = 0, 0
+package.preload["utils.perf"] = function()
+    return { now = function() return now_ms end }
+end
+package.loaded["utils.perf"] = nil
+
 local image_widgets = {}
 package.preload["ui/widget/imagewidget"] = function()
     return {
         new = function(_, opts)
+            now_ms = now_ms + decode_ms
             image_widgets[#image_widgets + 1] = opts
             opts.free = function() end
             opts.getSize = function()
@@ -114,6 +122,30 @@ Assert.eq(image_widgets[1].height, 60)
 Assert.is_true(image_widgets[1].original_in_nightmode, "默认夜间保持原色")
 Assert.eq(dirty_count, 0, "未上屏不得自己刷屏")
 
+-- 原地替换过的文件不能走 ImageWidget 的按路径位图缓存，必须重新解码交给 image=。
+local rendered = {}
+package.loaded["ui/renderimage"] = {
+    renderImageFile = function(_, path, _, w, h)
+        rendered[#rendered + 1] = { path = path, w = w, h = h }
+        return { fake_bb = true }
+    end,
+}
+local replaced_path = Config.dir() .. "/image-replaced-test.png"
+local replaced_file = assert(io.open(replaced_path, "wb"))
+replaced_file:write("replaced")
+replaced_file:close()
+Image.invalidate(replaced_path)
+Image.widget{ src = replaced_path, width = 40, height = 60 }:free()
+Assert.len(rendered, 1)
+Assert.eq(rendered[1].path, replaced_path)
+Assert.eq(rendered[1].w, 40)
+Assert.is_nil(image_widgets[#image_widgets].file, "失效路径不得按 file 命中旧位图")
+Assert.is_true(image_widgets[#image_widgets].image.fake_bb)
+Assert.is_true(image_widgets[#image_widgets].image_disposable)
+Assert.eq(image_widgets[1].file, image_path, "未失效路径仍走 file 缓存")
+os.remove(replaced_path)
+package.loaded["ui/renderimage"] = nil
+
 local glyph = Image.widget{ src = image_path, width = 40, height = 60, invert_in_night = true }
 Assert.is_false(image_widgets[#image_widgets].original_in_nightmode, "字形图夜间随屏反色")
 glyph:free()
@@ -134,6 +166,7 @@ local download_limit = #downloads
 Assert.is_true(download_limit < #network, "封面下载必须限制并发请求数")
 Assert.eq(download_limit, 10)
 Assert.eq(downloads[1].opts.connect_timeout, 30)
+Assert.is_true(downloads[1].opts.allow_redirects, "封面 CDN 常 302 到签名地址，必须跟随")
 Assert.eq(#image_widgets, local_images, "下载完成前不得创建图片控件")
 
 -- 取消第一个排队项后，活动项完成只能补进后一个未取消任务。
@@ -235,18 +268,30 @@ Stubs.flush()
 Assert.eq(#image_widgets, before_large + 3, "大图在后续帧解码")
 for i = 1, #large do large[i]:free() end
 
--- 续排若 0 延迟，UIManager 会在读输入前把整个队列解完，切页卡死。
 local delays = {}
 local schedule_in = UIManager.scheduleIn
 function UIManager:scheduleIn(delay, fn)
     delays[#delays + 1] = delay
     return schedule_in(self, delay, fn)
 end
+
+-- 预算内（缓存命中/快解码）一拍出齐，不得每张图空等一次续排。
+local page = {}
+for i = 1, 12 do
+    page[i] = Image.widget{ src = image_path, width = 200, height = 200 }
+end
+Stubs.flush()
+Assert.len(delays, 0, "预算内整页封面一拍解完")
+for i = 1, #page do page[i]:free() end
+
+-- 超预算必须续排；续排若 0 延迟，UIManager 会在读输入前把整个队列解完，切页卡死。
+decode_ms = 60
 local yielding = {
     Image.widget{ src = image_path, width = 200, height = 200 },
     Image.widget{ src = image_path, width = 200, height = 200 },
 }
 Stubs.flush()
+decode_ms = 0
 UIManager.scheduleIn = schedule_in
 Assert.len(delays, 1)
 Assert.is_true(delays[1] > 0, "续排解码必须让出输入轮询")
@@ -291,6 +336,8 @@ b:free()
 os.remove(image_path)
 os.remove(cached_file)
 
+package.preload["utils.perf"] = nil
+package.loaded["utils.perf"] = nil
 package.preload["http.request"] = nil
 package.loaded["http.request"] = nil
 package.loaded["ui.components.image"] = nil

@@ -16,11 +16,6 @@ function Setting.rowStatus()
         Auth.hasSession()
 end
 
----@return string
-function Setting.rowTitle()
-    return _("京东读书账号")
-end
-
 ---@param plugin table|nil
 local function showQrLogin(plugin)
     local Auth = require("source.jdread.auth")
@@ -29,9 +24,11 @@ local function showQrLogin(plugin)
     local InfoMessage = require("ui/widget/infomessage")
     local ButtonDialog = require("ui/widget/buttondialog")
     local ImageWidget = require("ui/widget/imagewidget")
+    local TextWidget = require("ui/widget/textwidget")
     local CenterContainer = require("ui/widget/container/centercontainer")
     local Geom = require("ui/geometry")
     local Screen = require("device").screen
+    local UI = require("ui.components.bookui")
 
     NetworkMgr:runWhenOnline(function()
         local cancelled = false
@@ -45,28 +42,30 @@ local function showQrLogin(plugin)
             end
         end
 
-        begin_job = Auth.beginQrLoginAsync(function(started, err)
-            begin_job = nil
-            if cancelled then return end
-            if not started then
-                UIManager:show(InfoMessage:new{ text = err or _("获取京东登录二维码失败") })
-                return
+        -- 取消按钮、点框外、返回键都走这里，否则后台轮询会一直跑到超时。
+        local function cancel()
+            cancelled = true
+            if begin_job then
+                begin_job.cancel()
+                begin_job = nil
             end
+            if wait_job then
+                wait_job.cancel()
+                wait_job = nil
+            end
+        end
 
-            local image = ImageWidget:new{
-                file = started.qr_path,
-                width = qr_size,
-                height = qr_size,
-                scale_factor = 0,
-            }
+        ---@param content table
+        local function showDialog(content)
+            closeDialog()
             dialog = ButtonDialog:new{
                 title = _("京东扫码登录"),
+                tap_close_callback = cancel,
                 buttons = {{
                     {
                         text = _("取消"),
                         callback = function()
-                            cancelled = true
-                            if wait_job then wait_job.cancel() end
+                            cancel()
                             closeDialog()
                         end,
                     },
@@ -75,12 +74,34 @@ local function showQrLogin(plugin)
             if dialog.addWidget then
                 dialog:addWidget(CenterContainer:new{
                     dimen = Geom:new{ w = Screen:getWidth() * 0.9, h = qr_size },
-                    image,
+                    content,
                 })
             end
             UIManager:show(dialog)
+        end
 
-            wait_job = Auth.waitQrLoginAsync(started.token, function(info, wait_err, status)
+        -- 点击即出框盖住入口：二维码要等一次网络往返，没有反馈用户会连点出多个登录流程。
+        showDialog(TextWidget:new{
+            text = _("正在获取二维码…"),
+            face = UI.face("xx_smallinfofont", 14),
+        })
+        begin_job = Auth.beginQrLoginAsync(function(started, err)
+            begin_job = nil
+            if cancelled then return end
+            if not started then
+                closeDialog()
+                UIManager:show(InfoMessage:new{ text = err or _("获取京东登录二维码失败") })
+                return
+            end
+
+            showDialog(ImageWidget:new{
+                file = started.qr_path,
+                width = qr_size,
+                height = qr_size,
+                scale_factor = 0,
+            })
+
+            wait_job = Auth.waitQrLoginAsync(started, function(info, wait_err, status)
                 wait_job = nil
                 if cancelled then return end
                 if status ~= "ok" or not info then
@@ -107,25 +128,35 @@ local function showQrLogin(plugin)
     end)
 end
 
+--- 设置页行：账号（扫码）；已登录时追加退出。
 ---@param plugin table|nil
-function Setting.open(plugin)
+---@return table[]
+function Setting.rows(plugin)
+    local SettingRow = require("ui.components.settingrow")
     local Auth = require("source.jdread.auth")
-    if not Auth.hasSession() then
-        showQrLogin(plugin)
-        return
-    end
-
-    require("ui.views.popup").sheet{
-        title = _("京东读书账号"),
-        items = {
-            { text = _("重新扫码登录"), callback = function() showQrLogin(plugin) end },
-            { text = _("退出登录"), callback = function()
-                Auth.clearSession()
-                require("source.registry").afterAuthChanged(plugin)
-            end },
-            { text = _("取消") },
-        },
+    local rows = {
+        function(iw)
+            local status, status_on = Setting.rowStatus()
+            return SettingRow.build(iw, { kind = "nav", icon = "account_circle", title = _("京东读书账号"),
+                status = status, status_on = status_on,
+                callback = function() showQrLogin(plugin) end })
+        end,
     }
+    if not Auth.hasSession() then return rows end
+    rows[#rows + 1] = function(iw)
+        return SettingRow.build(iw, { kind = "action", icon = "logout", title = _("退出登录"),
+            callback = function()
+                require("ui/uimanager"):show(require("ui/widget/confirmbox"):new{
+                    text = _("确定退出京东读书账号？"),
+                    ok_text = _("退出登录"),
+                    ok_callback = function()
+                        Auth.clearSession()
+                        require("source.registry").afterAuthChanged(plugin)
+                    end,
+                })
+            end })
+    end
+    return rows
 end
 
 return Setting

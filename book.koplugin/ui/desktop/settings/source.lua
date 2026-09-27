@@ -222,6 +222,34 @@ function Source:configSections(ctx)
         end
     end
     sections[#sections + 1] = { title = _("Z-Library"), rows = extra_rows }
+
+    local opds_rows = {
+        function(iw)
+            local on = MoonSettings.opdsEnabled()
+            return SettingRow.build(iw, {
+                kind = "toggle", icon = "rss_feed", title = _("OPDS"),
+                subtitle = _("底栏显示 OPDS；Calibre、Komga、Kavita 等书库，下载后导入本地书库"),
+                status = on and _("开") or _("关"),
+                status_on = on,
+                callback = function()
+                    MoonSettings.save({ opds_enabled = not on })
+                    notifyScopeChanged(desktop, plugin)
+                end,
+            })
+        end,
+    }
+    if MoonSettings.opdsEnabled() then
+        local opds_setting = require("opds.setting")
+        local status, status_on = opds_setting.rowStatus()
+        opds_rows[#opds_rows + 1] = function(iw)
+            return SettingRow.build(iw, {
+                kind = "nav", icon = "link", title = _("OPDS 目录"),
+                status = status, status_on = status_on,
+                callback = function() opds_setting.open(plugin) end,
+            })
+        end
+    end
+    sections[#sections + 1] = { title = _("OPDS"), rows = opds_rows }
     return sections
 end
 

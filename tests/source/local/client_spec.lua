@@ -7,6 +7,7 @@ local Stubs = require("support.stubs")
 -- sub 是第 2 层（分类）；sub/deep 是第 3 层（系列）；x4 是第 4 层，按约定不识别；bad.epub 模拟引擎解析失败
 -- a.epub.sdr 模拟 KOReader 边车目录：扫盘不当下钻，moveBook 时跟随书籍迁移
 local DENIED_DIRS = {}
+local COVERS = {}
 local TREE = {
     ["/books"] = { "a.epub", "a.epub.sdr", ".moon", ".hidden", "sub", "note.md", "old.cbr", "x.lit" },
     ["/books/a.epub.sdr"] = { "metadata.epub.lua" },
@@ -43,7 +44,9 @@ package.preload["libs/libkoreader-lfs"] = function()
         end,
         attributes = function(path, request)
             local attr
-            if DIRS[path] then
+            if COVERS[path] then
+                attr = { mode = "file", size = 10, modification = 0 }
+            elseif DIRS[path] then
                 attr = { mode = "directory", size = 0, modification = 0 }
             else
                 for dir, entries in pairs(TREE) do
@@ -135,18 +138,20 @@ local removed = {}
 local renames = {}
 
 -- 扫描走子进程（workers.job）：离线测试不 fork，worker 就地同步跑，
--- ctx.post 直接转给 on_progress，结果经 nextTick 交 on_done 保持异步语义。
+-- progress 直接转给 on_progress，结果经 nextTick 交 on_done 保持异步语义。
 -- 子进程不碰 sqlite 的约束由 db.base 在真机上强制，这里的 db.book 全是内存假实现。
+-- CRASH_AT 里的书一开打就模拟引擎段错误：子进程死亡，父进程只收到 "job exited without result"。
+local CRASH_AT = {}
+local job_runs = 0
 package.preload["workers.job"] = function()
     return {
         run = function(worker, opts)
             opts = opts or {}
-            local ctx = {
-                post = function(message)
-                    if opts.on_progress then opts.on_progress(message) end
-                end,
-            }
-            local ok, result = pcall(worker, ctx)
+            job_runs = job_runs + 1
+            local ok, result = pcall(worker, function(value)
+                if opts.on_progress then opts.on_progress(value) end
+                if value and CRASH_AT[value] then error("job exited without result") end
+            end)
             require("ui/uimanager"):nextTick(function()
                 if ok then
                     if opts.on_done then
@@ -156,7 +161,7 @@ package.preload["workers.job"] = function()
                     opts.on_failed(result)
                 end
             end)
-            return { abort = function() end }
+            return { cancel = function() end }
         end,
     }
 end
@@ -186,6 +191,8 @@ package.preload["db.book"] = function()
         end,
         renameStableId = function(source_id, old_stable_id, new_stable_id, category, series)
             renames[#renames + 1] = { source_id, old_stable_id, new_stable_id }
+            -- 与真实 sqlite 一致：新 stable_id 已有行（含墓碑）时主键冲突，整笔回滚
+            if db_rows[rowKey(source_id, new_stable_id)] then return false end
             local row = db_rows[rowKey(source_id, old_stable_id)]
             if row then
                 db_rows[rowKey(source_id, old_stable_id)] = nil
@@ -294,6 +301,8 @@ local function reset()
     props_read = 0
     dirs_scanned = {}
     removed_files = {}
+    CRASH_AT = {}
+    job_runs = 0
 end
 
 -- ── 子目录列不出来：整次扫盘失败，不按残缺快照 reconcile 软删其中的书 ──────
@@ -403,6 +412,65 @@ do
     Assert.eq(#renames, 1)
 end
 
+-- ── 扫盘内的 md5 改名识别：只有旧文件已消失且新路径无任何行才改名 ──────
+do
+    local util = require("util")
+    local real_md5 = util.partialMD5
+    local digests = {}
+    util.partialMD5 = function(path) return digests[path] end
+
+    --- 跑一次全量扫描，返回 ok, err
+    local function scan()
+        local ok, err
+        Client.new({ path = "/books" }):scanAsync(function(o, e) ok, err = o, e end)
+        Stubs.flush()
+        return ok, err
+    end
+
+    -- 真移动：旧路径已不在盘上，新路径无行 → 原地改名，继承旧行
+    reset()
+    digests = { ["/books/a.epub"] = "m" }
+    db_rows[rowKey("local", "/books/gone.epub")] = {
+        source_id = "local", stable_id = "/books/gone.epub", md5 = "m", title = "旧", inserted_at = 7,
+    }
+    Assert.is_true(scan())
+    Assert.len(renames, 1)
+    Assert.is_nil(db_rows[rowKey("local", "/books/gone.epub")])
+    Assert.eq(db_rows[rowKey("local", "/books/a.epub")].inserted_at, 7)
+
+    -- 同内容副本并存且其一元数据残缺（不在 known）：不能把另一本改名过来撞主键
+    reset()
+    digests = { ["/books/a.epub"] = "dup", ["/books/sub/c.pdf"] = "dup" }
+    db_rows[rowKey("local", "/books/a.epub")] = {
+        source_id = "local", stable_id = "/books/a.epub", md5 = "dup",
+        title = "a", authors = "x", intro = "y", deleted = 0,
+    }
+    db_rows[rowKey("local", "/books/sub/c.pdf")] = {
+        source_id = "local", stable_id = "/books/sub/c.pdf", md5 = "dup", title = "c", deleted = 0,
+    }
+    local ok, err = scan()
+    Assert.is_true(ok)
+    Assert.is_nil(err)
+    Assert.len(renames, 0)
+    Assert.eq(db_rows[rowKey("local", "/books/a.epub")].deleted, 0)
+    Assert.eq(db_rows[rowKey("local", "/books/sub/c.pdf")].deleted, 0)
+
+    -- 新路径是墓碑：旧文件虽已消失，也不改名，墓碑由快照复活
+    reset()
+    digests = { ["/books/a.epub"] = "m" }
+    db_rows[rowKey("local", "/books/gone.epub")] = {
+        source_id = "local", stable_id = "/books/gone.epub", md5 = "m", title = "旧",
+    }
+    db_rows[rowKey("local", "/books/a.epub")] = {
+        source_id = "local", stable_id = "/books/a.epub", md5 = "m", title = "a", deleted = 1,
+    }
+    Assert.is_true(scan())
+    Assert.len(renames, 0)
+    Assert.eq(db_rows[rowKey("local", "/books/a.epub")].deleted, 0)
+
+    util.partialMD5 = real_md5
+end
+
 -- ── 元数据缓存命中：重扫跳过解析 ──────
 do
     reset()
@@ -425,6 +493,54 @@ do
     Assert.len(covers_saved, 5)
     Assert.len(upserts, 6) -- 缓存命中不重解析，但完整快照仍批量恢复书架成员
     Assert.eq(db_rows[rowKey("local", "/books/a.epub")].percent, 42)
+end
+
+-- ── 已入库且封面已缓存的书，重扫不再打开文档 ──────
+do
+    reset()
+    local c = Client.new({ path = "/books" })
+    c:scanAsync(function() end)
+    Stubs.flush()
+    COVERS["/data/.moon/cache/local/image//books/a.epub.png"] = true
+    opened = {}
+    c:scanAsync(function() end)
+    Stubs.flush()
+    COVERS = {}
+    Assert.len(opened, 4)
+    Assert.is_false(hasValue(opened, "/books/a.epub"))
+end
+
+-- ── 子进程死在某本书的引擎里：跳过它重扫，其余书照常入库，坏书按文件名入库 ──────
+do
+    reset()
+    CRASH_AT["/books/sub/c.pdf"] = true
+    local ok, err
+    Client.new({ path = "/books" }):scanAsync(function(o, e) ok, err = o, e end)
+    Stubs.flush()
+    Assert.is_true(ok)
+    Assert.is_nil(err)
+    Assert.eq(job_runs, 2)
+    Assert.eq(db_rows[rowKey("local", "/books/sub/c.pdf")].title, "c")
+    Assert.eq(db_rows[rowKey("local", "/books/sub/deep/e.epub")].title, "T:/books/sub/deep/e.epub")
+
+    -- 两本坏书：逐本跳过，最终收敛
+    reset()
+    CRASH_AT["/books/a.epub"] = true
+    CRASH_AT["/books/sub/deep/e.epub"] = true
+    Client.new({ path = "/books" }):scanAsync(function(o, e) ok, err = o, e end)
+    Stubs.flush()
+    Assert.is_true(ok)
+    Assert.eq(job_runs, 3)
+    Assert.eq(db_rows[rowKey("local", "/books/a.epub")].title, "a")
+
+    -- 不在打开文档时失败（如目录列不出来）：不重试，照常报错
+    reset()
+    DENIED_DIRS["/books/sub"] = true
+    Client.new({ path = "/books" }):scanAsync(function(o, e) ok, err = o, e end)
+    Stubs.flush()
+    DENIED_DIRS["/books/sub"] = nil
+    Assert.is_false(ok)
+    Assert.eq(job_runs, 1)
 end
 
 -- ── 单本入库：只解析目标文件，不扫盘、不清失效 ──────
