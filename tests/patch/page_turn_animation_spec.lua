@@ -90,4 +90,49 @@ Assert.is_true(PageTurnAnimation.setEnabled(false).ok)
 Assert.eq(store.full_refresh_count, 3)
 Assert.eq(store.night_full_refresh_count, 6)
 
+-- 风格：未设置 / 已下线的值回退擦除；选择器落设置并只在真正改变时回调。
+local popup_opts
+package.loaded["ui.views.popup"] = { list = function(opts) popup_opts = opts end }
+Assert.eq(PageTurnAnimation.currentStyle().value, "wipe")
+store.swipe_animation_style = "cover"
+Assert.eq(PageTurnAnimation.currentStyle().value, "wipe")
+store.swipe_animation_style = "box"
+Assert.eq(PageTurnAnimation.currentStyle().text, "方框")
+
+local changes = 0
+PageTurnAnimation.pickStyle(function() changes = changes + 1 end)
+Assert.eq(popup_opts.current, "box")
+Assert.eq(popup_opts.items, PageTurnAnimation.STYLES)
+popup_opts.on_select("box")
+Assert.eq(changes, 0, "选了当前值不算改变")
+popup_opts.on_select("split")
+Assert.eq(store.swipe_animation_style, "split")
+Assert.eq(changes, 1)
+PageTurnAnimation.pickStyle()
+popup_opts.on_select("wipe")
+Assert.eq(store.swipe_animation_style, "wipe", "无回调也能落设置")
+
+-- 启动自检：已安装但运行时补丁内容变了（插件升级）时重新分发并提示重启；没变则静默。
+local shown = {}
+UIManager.show = function(_, widget) shown[#shown + 1] = widget end
+local Manager = require("patch.manager")
+local function startup(install_res)
+    Manager.install = function() return install_res end
+    shown = {}
+    store.swipe_animations = true
+    package.loaded["patch.page_turn_animation"] = nil
+    require("patch.page_turn_animation").checkStartup()
+end
+
+startup({ ok = true, changed = false })
+Assert.len(shown, 0)
+
+startup({ ok = true, changed = true })
+Assert.len(shown, 1)
+Assert.eq(shown[1].text, "翻页动画补丁已更新，需重启 KOReader 生效。")
+
+startup({ ok = false, err = "disk full" })
+Assert.len(shown, 1)
+Assert.matches(shown[1].text, "disk full")
+
 return true

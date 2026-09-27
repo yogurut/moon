@@ -274,6 +274,7 @@ local function showFullscreen(path)
     local ImageWidget = require("ui/widget/imagewidget")
     local BookInfo = require("ui.components.bookinfo")
     local w, h = Device.screen:getWidth(), Device.screen:getHeight()
+    local pw, ph = require("lockscreen.layout").portraitSize()
     local viewer
     local function close()
         UIManager:close(viewer, "full")
@@ -292,8 +293,8 @@ local function showFullscreen(path)
         CenterContainer:new{
             dimen = Geom:new{ w = w, h = h },
             ImageWidget:new{
-                file = path, width = w, height = h,
-                scale_factor = 0, file_do_cache = false,
+                file = path, file_do_cache = false,
+                scale_factor = math.min(w / pw, h / ph),
             },
         },
     }
@@ -329,13 +330,13 @@ function Lockscreen.preview(width)
     local tap = require("ui.components.bookinfo").tappable(width, preview_h, function()
         showFullscreen(path)
     end)
+    local pw, ph = require("lockscreen.layout").portraitSize()
     tap[1] = Overlay.previewBox(width, CenterContainer:new{
         dimen = Geom:new{ w = inner_w, h = inner_h },
+        -- 不给 width/height：否则控件是整框，夜间模式整框反色，两侧留白变成白条。
         ImageWidget:new{
             file = path,
-            width = inner_w,
-            height = inner_h,
-            scale_factor = 0,
+            scale_factor = math.min(inner_w / pw, inner_h / ph),
             -- compose.png 原地覆写，ImageCache 按路径命中会一直显示旧图。
             file_do_cache = false,
         },

@@ -19,6 +19,52 @@ local PageTurnAnimation = {}
 
 PageTurnAnimation.FEATURE = "page_turn_animation"
 
+--- 动画风格设置键；运行时补丁每次翻页读取，切换无需重启。
+PageTurnAnimation.STYLE_KEY = "swipe_animation_style"
+
+--- 可选风格；value 必须与 2-swipe-animation-core.lua 的 SwipeAnimation.STYLES 键一致。
+PageTurnAnimation.STYLES = {
+    { text = _("擦除"), value = "wipe" },
+    { text = _("翻页阴影"), value = "shadow" },
+    { text = _("纵向擦除"), value = "wipe_vertical" },
+    { text = _("斜向擦除"), value = "diagonal" },
+    { text = _("分割"), value = "split" },
+    { text = _("百叶窗"), value = "blinds" },
+    { text = _("梳状"), value = "comb" },
+    { text = _("随机线条"), value = "random_bars" },
+    { text = _("方框"), value = "box" },
+    { text = _("螺旋"), value = "spiral" },
+    { text = _("时钟"), value = "clock" },
+    { text = _("逐行"), value = "typewriter" },
+    { text = _("棋盘"), value = "checkerboard" },
+    { text = _("随机方块"), value = "random_blocks" },
+}
+
+--- 当前风格；未设置或已下线的值与运行时补丁一致，回退为第一项（擦除）。
+---@return { text: string, value: string }
+function PageTurnAnimation.currentStyle()
+    local value = G_reader_settings:readSetting(PageTurnAnimation.STYLE_KEY)
+    for _, item in ipairs(PageTurnAnimation.STYLES) do
+        if item.value == value then return item end
+    end
+    return PageTurnAnimation.STYLES[1]
+end
+
+--- 弹出风格单选，选中后落设置；下一次翻页即生效。
+---@param on_change fun()|nil 风格真正改变后回调（刷新调用方界面）
+function PageTurnAnimation.pickStyle(on_change)
+    local current = PageTurnAnimation.currentStyle().value
+    require("ui.views.popup").list{
+        title = _("翻页动画风格"), items = PageTurnAnimation.STYLES,
+        current = current, choice_icons = true, centered = true,
+        on_select = function(value)
+            if not value or value == current then return end
+            G_reader_settings:saveSetting(PageTurnAnimation.STYLE_KEY, value)
+            if on_change then on_change() end
+        end,
+    }
+end
+
 local _startup_checked = false
 
 --- fdroid Android 把 userpatch 干成 no-op，补丁写了也不会被加载。
@@ -115,6 +161,16 @@ function PageTurnAnimation.checkStartup()
     if not PageTurnAnimation.isEnabled() then return end
     if Manager.isApplied(PageTurnAnimation.FEATURE) then
         forceFullRefreshNever()
+        -- 插件升级后运行时补丁内容可能已变，isApplied 只看文件在不在；重装是幂等的。
+        local res = Manager.install(PageTurnAnimation.FEATURE)
+        if not res.ok then
+            UIManager:show(InfoMessage:new{
+                text = T(_("翻页动画补丁更新失败：%1"), tostring(res.err or "")),
+                timeout = 3,
+            })
+        elseif res.changed then
+            PageTurnAnimation.promptRestart()
+        end
         return
     end
 

@@ -56,6 +56,32 @@ Assert.eq(saved_section.name, "reader")
 Assert.eq(updates, 1)
 reader_section = {}
 
+-- 动画开启时多一行风格选择，显示当前风格名；未设置时显示默认擦除。
+local animation_on = true
+local style = { text = "擦除", value = "wipe" }
+local on_change
+package.loaded["patch.page_turn_animation"] = {
+    isEnabled = function() return animation_on end,
+    currentStyle = function() return style end,
+    pickStyle = function(cb) on_change = cb end,
+}
+package.loaded["ui.desktop.settings.reader"] = nil
+Settings = require("ui.desktop.settings.reader")
+local rows = Settings:sections(desktop)[1].rows
+Assert.len(rows, 4)
+local style_row = rows[3](600)
+Assert.eq(style_row.title, "翻页动画风格")
+Assert.eq(style_row.status, "擦除")
+style_row.callback()
+local before = updates
+on_change()
+Assert.eq(updates, before + 1, "选中后刷新设置页")
+style = { text = "方框", value = "box" }
+Assert.eq(Settings:sections(desktop)[1].rows[3](600).status, "方框")
+Assert.eq(rows[4](600).title, "读到 99% 自动标记已读")
+animation_on = false
+Assert.len(Settings:sections(desktop)[1].rows, 3)
+
 local lookup = Settings:lookupSections(desktop)
 local titles = {}
 for _, section in ipairs(lookup) do

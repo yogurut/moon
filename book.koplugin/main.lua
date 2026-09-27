@@ -66,6 +66,7 @@ function BookPlugin:init()
     require("nightmode").onCreate()
     require("ime.init").onCreate()
     require("patch.manager").onCreate({ plugin_root = self.path })
+    require("convert.azw3document"):register(require("document/documentregistry"))
     if self.ui and self.ui.document then
         self:emitToSource("reader_open")
     end
@@ -160,6 +161,11 @@ function BookPlugin:onResume()
     require("lockscreen.init").onResume()
     require("remote.init").onResume()
     require("nightmode").onResume()
+end
+
+--- 前光变化：手动调亮度时关闭自动亮度。
+function BookPlugin:onFrontlightStateChanged()
+    require("nightmode").onFrontlightChanged()
 end
 
 --- 退出：停更新任务、远程服务，并销毁仍打开的桌面。

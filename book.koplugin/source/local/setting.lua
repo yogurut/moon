@@ -46,14 +46,16 @@ function Setting.rows(plugin)
         local dialog
         dialog = InputDialog:new{ title = title, input = tostring(cfg[key] or ""),
             text_type = password and "password" or nil,
-            buttons = {{ text = _("取消"), id = "close", callback = function() UIManager:close(dialog) end },
-                { text = _("保存"), callback = function()
+            buttons = {{
+                { text = _("取消"), id = "close", callback = function() UIManager:close(dialog) end },
+                { text = _("保存"), is_enter_default = true, callback = function()
                     cfg[key] = Text.trim(dialog:getInputText())
                     require("utils.settings").saveSource(SOURCE_ID, cfg)
                     require("source.registry").invalidate()
                     UIManager:close(dialog)
                     if plugin and plugin.desktop then plugin.desktop:updateView() end
-                end }}}
+                end },
+            }}}
         UIManager:show(dialog); dialog:onShowKeyboard()
     end
     local function row(key, title, password, icon)
@@ -64,12 +66,30 @@ function Setting.rows(plugin)
                 status_on = value ~= "", callback = function() edit(key, title, password) end })
         end
     end
+    local function testRow(iw)
+        return SettingRow.build(iw, { kind = "action", icon = "network_check", title = _("测试 WebDAV 连接"),
+            subtitle = _("写入、读回并删除一个测试文件"), callback = function()
+                local UIManager = require("ui/uimanager")
+                local InfoMessage = require("ui/widget/infomessage")
+                local waiting = InfoMessage:new{ text = _("正在测试 WebDAV 连接…") }
+                UIManager:show(waiting)
+                local client = require("source.local.client").new(require("utils.settings").getSource(SOURCE_ID))
+                client:testWebdavAsync(function(ok, err)
+                    UIManager:close(waiting)
+                    UIManager:show(InfoMessage:new{
+                        text = ok and _("WebDAV 连接正常，可读写") or err,
+                        timeout = ok and 2 or nil,
+                    })
+                end)
+            end })
+    end
     return {
         localPathRow,
         row("webdav_url", _("WebDAV 地址"), false, "dns"),
         row("webdav_username", _("WebDAV 用户名"), false, "person"),
         row("webdav_password", _("WebDAV 密码"), true, "key"),
         row("webdav_path", _("WebDAV 目录"), false, "folder"),
+        testRow,
     }
 end
 
