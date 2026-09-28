@@ -12,6 +12,7 @@ local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local Text = require("utils.text")
 local _ = require("gettext")
+local T = require("ffi/util").template
 local Job = require("workers.job")
 local Webdav = require("http.webdav")
 local Paths = require("utils.paths")
@@ -28,8 +29,21 @@ end
 
 ---@class LocalClient
 ---@field cfg table
+---@field dav WebdavClient
 local Client = {}
-Client.__index = Client
+
+--- cfg 是 utils.settings 的共享表，设置页和远程配置会原地改它；dav 每次按 cfg 现造，不存快照。
+Client.__index = function(self, key)
+    if key == "dav" then
+        local cfg = rawget(self, "cfg")
+        return Webdav.new{
+            url = cfg.webdav_url,
+            username = cfg.webdav_username,
+            password = cfg.webdav_password,
+        }
+    end
+    return Client[key]
+end
 
 local SOURCE_ID = "local"
 
@@ -88,15 +102,7 @@ end
 ---@param cfg table|nil
 ---@return LocalClient
 function Client.new(cfg)
-    cfg = cfg or {}
-    return setmetatable({
-        cfg = cfg,
-        dav = Webdav.new{
-            url = cfg.webdav_url,
-            username = cfg.webdav_username,
-            password = cfg.webdav_password,
-        },
-    }, Client)
+    return setmetatable({ cfg = cfg or {} }, Client)
 end
 
 ---@return boolean
@@ -139,6 +145,13 @@ local function remoteRelativePath(stable_id)
     if type(stable_id) ~= "string" then return nil end
     local rel = stable_id:match("^webdav://(.+)$")
     return rel and rel ~= "" and rel or nil
+end
+
+--- 是否 WebDAV 书。配置 WebDAV 后，按绝对路径登记的书（未收编 / 书库外打开）仍是纯本地书。
+---@param stable_id string
+---@return boolean
+function Client.isRemote(stable_id)
+    return remoteRelativePath(stable_id) ~= nil
 end
 
 --- 静读天下的 Cover/Cache 边车按书文件 basename 寻址，不含分类目录。
@@ -288,9 +301,9 @@ local function decodeBooksSync(raw)
     return nil
 end
 
---- 逐项串行异步遍历：step(item, next) 处理完一项调 next()，全部处理完调 done()。
+--- 逐项串行异步遍历：step(item, next, index) 处理完一项调 next()，全部处理完调 done()。
 ---@param list any[]
----@param step fun(item: any, next: fun())
+---@param step fun(item: any, next: fun(), index: integer)
 ---@param done fun()
 local function eachAsync(list, step, done)
     local index = 0
@@ -300,7 +313,7 @@ local function eachAsync(list, step, done)
         if item == nil then
             return done()
         end
-        step(item, next_item)
+        step(item, next_item, index)
     end
     next_item()
 end
@@ -516,7 +529,7 @@ end
 ---   主进程在 fork 前查好「已入库且标题非空」的行交给子进程判断是否要解析，
 ---   子进程返回扫描产物列表，主进程收齐后落库。
 
---- 主进程：本地源元数据完整的行，按 stable_id（即路径）索引；
+--- 主进程：扫盘解析过的行（有 md5 且有书名），按 stable_id（即路径）索引；
 --- 另附全部行（含残缺行与墓碑）的内容 md5，供子进程识别同路径换了文件。
 ---@return table<string, Book> known, table<string, string> digests
 local function knownBooks()
@@ -525,11 +538,9 @@ local function knownBooks()
     local digests = {}
     for stable_id, row in pairs(rows) do
         digests[stable_id] = row.md5
-        -- 任何展示元数据缺失都要允许本次扫描补齐；只看 title 会把
-        -- “有书名但没有作者/简介”的旧行永久冻结。
-        if (type(row.title) ~= "string" or row.title == "")
-            or (type(row.authors) ~= "string" or row.authors == "")
-            or (type(row.intro) ~= "string" or row.intro == "") then
+        -- md5 只由扫盘/入库写入，有它就说明按当前内容解析过；作者/简介缺失多半是书本身没有，
+        -- 按缺字段判定会让每次扫盘重开几乎所有书。无 md5 的身份行（开书时登记）照常解析补齐。
+        if not row.md5 or type(row.title) ~= "string" or row.title == "" then
             rows[stable_id] = nil
         end
     end
@@ -544,9 +555,10 @@ end
 ---@param known table<string, Book>
 ---@param digests table<string, string> 库内各路径的内容 md5
 ---@param skip table<string, boolean> 曾让子进程崩溃的书，不再打开
+---@param tried table<string, boolean> 本会话已为补封面打开过的书（本身没封面的书不必每轮重开）
 ---@param progress fun(value: string|false)
----@return table f 原表，补上 md5/changed，需解析时再补 title/authors/intro
-local function parseFile(f, known, digests, skip, progress)
+---@return table f 原表，补上 md5/changed/cover_tried，需解析时再补 title/authors/intro
+local function parseFile(f, known, digests, skip, tried, progress)
     local open = not skip[f.path]
     f.md5 = util.partialMD5(f.path)
     local old = digests[f.path]
@@ -554,7 +566,8 @@ local function parseFile(f, known, digests, skip, progress)
     if f.changed then
         os.remove(coverPath(f.path))
     elseif known[f.path] then
-        if open and lfs.attributes(coverPath(f.path), "mode") ~= "file" then
+        if open and not tried[f.path] and lfs.attributes(coverPath(f.path), "mode") ~= "file" then
+            f.cover_tried = true
             progress(f.path)
             ensureCover(f.path)
             progress(false)
@@ -563,6 +576,7 @@ local function parseFile(f, known, digests, skip, progress)
     end
     local props = {}
     if open then
+        f.cover_tried = true
         progress(f.path)
         props = parseBookProps(f.path) or {}
         progress(false)
@@ -611,7 +625,7 @@ local function commitFiles(files, known, full_snapshot)
                 and not BookDB.setLibraryMembership(SOURCE_ID, f.path, true) then
                 return false
             end
-        -- knownBooks 只把元数据完整的行交给 worker；移动过来的旧行也会
+        -- knownBooks 只把解析过的行交给 worker；移动过来的旧行也会
         -- 在这里用本次解析结果补齐。不要把“已存在”误当成“无需更新”。
         -- 换了内容的行即便走快照也要本地可信写入：reconcile 对脏行保留旧书名。
         elseif (f.changed or not full_snapshot) and not BookDB.upsert({
@@ -631,27 +645,50 @@ local function commitFiles(files, known, full_snapshot)
 end
 
 --- 扫盘任务：遍历与解析在子进程，落库在主进程，cancel 杀子进程。
---- 子进程死在某本书的引擎里时跳过它重扫（每轮至少多跳一本，必然收敛）；
+--- 子进程死在某本书的引擎里时跳过它重扫（每轮至少多跳一本，必然收敛），本会话内不再打开它；
 --- 其余失败照常回调，库里是旧数据，照查，不让 UI 空转。
----@param root string
+--- 子进程 progress 两种帧：`{ i, n, name }` 是逐本计数；路径 / false 是开文档前后的崩溃探针。
+---@param self LocalClient
 ---@param cb fun(ok: boolean, err: string|nil)
+---@param report fun(text: string, done: integer|nil, total: integer|nil)|nil
 ---@return { cancel: fun() }
-local function scanJob(root, cb)
+local function scanJob(self, cb, report)
+    report = report or function() end
+    local root = rootPath(self.cfg)
     local known, digests = knownBooks()
-    local skip, job = {}, nil
+    local job
+    -- 崩溃记录跨轮保留：入库后缺封面还会被补提，不记住的话每轮扫盘都要再崩一次、整轮重来
+    self._crashed = self._crashed or {}
+    self._cover_tried = self._cover_tried or {}
+    local skip, tried = self._crashed, self._cover_tried
     local function start()
-        local opening
+        local opening, count
+        report(_("正在扫描书库…"))
         job = Job.run(function(progress)
             local files = scanFiles(root)
             for i = 1, #files do
-                files[i] = parseFile(files[i], known, digests, skip, progress)
+                progress({ i, #files, files[i].name })
+                files[i] = parseFile(files[i], known, digests, skip, tried, progress)
             end
             return files
         end, {
             name = "local.scan",
             kind = "medium",
-            on_progress = function(path) opening = path or nil end,
+            on_progress = function(value)
+                if type(value) == "table" then
+                    count = value
+                    report(T(_("正在检查 %1"), value[3]), value[1], value[2])
+                    return
+                end
+                opening = value or nil
+                if opening and count then
+                    report(T(_("正在解析 %1"), count[3]), count[1], count[2])
+                end
+            end,
             on_done = function(files)
+                for _, f in ipairs(files or {}) do
+                    if f.cover_tried then tried[f.path] = true end
+                end
                 if commitFiles(files or {}, known, true) then
                     cb(true)
                 else
@@ -896,7 +933,7 @@ function Client:indexOneAsync(path, cb)
     end
     local known, digests = knownBooks()
     local job = Job.run(function(progress)
-        return parseFile({ name = name, path = path }, known, digests, {}, progress)
+        return parseFile({ name = name, path = path }, known, digests, {}, {}, progress)
     end, {
         name = "local.index",
         kind = "light",
@@ -919,16 +956,17 @@ end
 
 --- 强制扫盘写库（不查询）。供 syncBooksAsync(force) 使用。
 ---@param cb fun(ok: boolean, err: any)
+---@param report fun(text: string, done: integer|nil, total: integer|nil)|nil 真实步骤上报
 ---@return { cancel: fun() }|nil
-function Client:scanAsync(cb)
+function Client:scanAsync(cb, report)
     if self:isWebdav() then
-        return self:scanWebdavAsync(cb, { refresh = true })
+        return self:scanWebdavAsync(cb, { refresh = true, on_progress = report })
     end
     local ok, err = self:validatePath()
     if not ok then
         return defer(cb, false, err)
     end
-    return scanJob(rootPath(self.cfg), cb)
+    return scanJob(self, cb, report)
 end
 
 --- 远端 .Moon+ 下的路径。
@@ -966,6 +1004,7 @@ end
 ---@field local_files table<string, table>|nil 刷新时扫出的本地书库目录文件（相对路径 → scanFiles 条目）
 ---@field meta_failed boolean|nil books.sync 存在但读不出：本轮不能回写，否则会覆盖别的设备的书目
 ---@field covers table<string, boolean> 远端已有封面的 sidecar 键
+---@field report fun(text: string, done: integer|nil, total: integer|nil) 真实步骤上报
 ---@field active table|nil
 ---@field cancelled boolean
 
@@ -976,6 +1015,7 @@ end
 ---@param next fun(err: string|nil)
 local function listBooks(self, run, next)
     local function walk(path, prefix, done)
+        run.report(T(_("正在列出远端目录 %1"), path))
         run.active = self.dav:listAsync(path, function(entries, err)
             if run.cancelled then return end
             if not entries then done(err or "WebDAV list failed"); return end
@@ -993,6 +1033,7 @@ local function listBooks(self, run, next)
         end)
     end
     -- 固定布局目录（书库根、.Moon+、Cache、Cover）不存在就建，已存在时 MKCOL 返回 405 视为成功。
+    run.report(_("正在检查远端目录…"))
     run.active = self.dav:ensurePathAsync(moonPath(self, "Cache"), function(ok, err)
         if run.cancelled then return end
         if not ok then return next(err) end
@@ -1012,6 +1053,7 @@ local function scanLocal(self, run, next)
     run.local_files = {}
     local root = localRoot(self)
     if not root then return next() end
+    run.report(_("正在扫描本地书库…"))
     run.active = Job.run(function()
         return scanFiles(root)
     end, {
@@ -1070,6 +1112,7 @@ end
 local function pullBooksSync(self, run, next)
     local temp = self:webdavCacheRoot() .. "/.books.sync"
     ensureParent(temp)
+    run.report(_("正在下载书目…"))
     run.active = self.dav:getAsync(moonPath(self, "books.sync"), temp, nil, function(ok, err, code)
         if run.cancelled then return end
         local raw = ok and readFile(temp)
@@ -1091,11 +1134,11 @@ local function pullBooksSync(self, run, next)
 
         local BookDB = require("db.book")
         run.files = memberFiles(run)
-        -- 书目为空而本地书架非空：多半是目录填错或服务端异常，本轮不下架任何书。
+        -- 书目为空而本地书架非空：首次同步，或目录填错 / 服务端异常。本轮不下架任何书，
+        -- 但照常上传本地书、写书目（meta_failed 只表示书目读不出、不能回写）。
         local live = BookDB.libraryStableIdsBySource(SOURCE_ID)
         if #run.files == 0 and #live > 0 then
             require("utils.log").warn("book webdav remote library empty; skip reconcile")
-            run.meta_failed = true
             return next()
         end
         local before = BookDB.getMany(SOURCE_ID, live)
@@ -1112,6 +1155,7 @@ local function pullBooksSync(self, run, next)
             end
             rows[i] = row
         end
+        run.report(T(_("正在写入书架（%1 本）"), #rows))
         if not BookDB.reconcile(SOURCE_ID, rows) then
             return next("failed to save WebDAV book metadata")
         end
@@ -1134,6 +1178,7 @@ end
 ---@param next fun(err: string|nil)
 local function pullProgress(self, run, next)
     local ProgressDB = require("db.progress")
+    run.report(_("正在检查阅读进度…"))
     run.active = self.dav:listAsync(moonPath(self, "Cache"), function(entries, err)
         if run.cancelled then return end
         if not entries then
@@ -1152,7 +1197,8 @@ local function pullProgress(self, run, next)
         end
         local temp = self:webdavCacheRoot() .. "/.progress"
         ensureParent(temp)
-        eachAsync(pending, function(item, next_item)
+        eachAsync(pending, function(item, next_item, i)
+            run.report(T(_("正在下载进度 %1"), item.rel), i, #pending)
             run.active = self.dav:getAsync(progressRemotePath(self, item.rel), temp, nil, function(ok)
                 if run.cancelled then return end
                 local pos = ok and decodeProgress(readFile(temp))
@@ -1172,6 +1218,7 @@ end
 ---@param run WebdavRun
 ---@param next fun(err: string|nil)
 local function pullCovers(self, run, next)
+    run.report(_("正在检查封面…"))
     run.active = self.dav:listAsync(moonPath(self, "Cover"), function(entries, err)
         if run.cancelled then return end
         if not entries then
@@ -1191,7 +1238,8 @@ local function pullCovers(self, run, next)
                 pending[#pending + 1] = rel
             end
         end
-        eachAsync(pending, function(rel, next_item)
+        eachAsync(pending, function(rel, next_item, i)
+            run.report(T(_("正在下载封面 %1"), rel), i, #pending)
             local target = coverPath(remoteStableId(rel))
             ensureParent(target)
             run.active = self.dav:getAsync(coverRemotePath(self, rel), target .. ".part", nil, function(ok)
@@ -1232,6 +1280,7 @@ local function enrichCached(self, run, next)
         end
     end
     if #pending == 0 then return next() end
+    run.report(T(_("正在解析 %1 本书的信息"), #pending))
     run.active = Job.run(function()
         local out = {}
         for i, item in ipairs(pending) do out[i] = parseBookProps(item.path, item.stable_id) or {} end
@@ -1304,7 +1353,8 @@ local function uploadLocal(self, run, next)
     end
     local member = {}
     for _, rel in ipairs(run.files) do member[rel] = true end
-    eachAsync(pending, function(rel, next_item)
+    eachAsync(pending, function(rel, next_item, i)
+        run.report(T(_("正在上传 %1"), rel), i, #pending)
         local item, stable_id = run.local_files[rel], remoteStableId(rel)
         local parent = rel:match("^(.+)/[^/]+$")
         run.active = self.dav:ensurePathAsync(self:webdavPath() .. (parent and "/" .. parent or ""),
@@ -1348,7 +1398,8 @@ local function uploadCovers(self, run, next)
             pending[#pending + 1] = rel
         end
     end
-    eachAsync(pending, function(rel, next_item)
+    eachAsync(pending, function(rel, next_item, i)
+        run.report(T(_("正在上传封面 %1"), rel), i, #pending)
         run.active = self.dav:putFileAsync(coverRemotePath(self, rel), coverPath(remoteStableId(rel)), function()
             if run.cancelled then return end
             next_item()
@@ -1428,6 +1479,7 @@ local function pushBooksSync(self, run, next)
         next()
     end
     if not changed then return confirm() end
+    run.report(T(_("正在更新书目（%1 本）"), #list))
     run.active = writeBooksSync(self, list, function(ok, err)
         if run.cancelled then return end
         if not ok then
@@ -1453,7 +1505,7 @@ local REFRESH_STEPS = {
 ---   <根>/.Moon+/Stats/stats.json       阅读统计（本插件私有，所有设备共用）
 --- 正文不下载，openWebdavAsync 按需拉到本地书库目录。
 ---@param cb fun(ok: boolean, err: string|nil)
----@param opts { refresh?: boolean }|nil refresh=用户点刷新：另扫远端文件与本地目录合并
+---@param opts { refresh?: boolean, on_progress?: fun(text: string, done: integer|nil, total: integer|nil) }|nil refresh=用户点刷新：另扫远端文件与本地目录合并
 ---@return { cancel: fun() }|nil
 function Client:scanWebdavAsync(cb, opts)
     local ok, err = self:validatePath()
@@ -1463,7 +1515,8 @@ function Client:scanWebdavAsync(cb, opts)
     local steps = opts and opts.refresh and REFRESH_STEPS or SYNC_STEPS
     ---@type WebdavRun
     local run = { files = {}, entries = {}, covers = {}, cancelled = false,
-        remote = steps == REFRESH_STEPS and {} or nil }
+        remote = steps == REFRESH_STEPS and {} or nil,
+        report = opts and opts.on_progress or function() end }
     local index = 0
     local function nextStep(step_err)
         if run.cancelled then return end
@@ -1868,14 +1921,14 @@ function Client:getProgressAsync(stable_id, cb)
         end)
 end
 
---- 推送单本进度（关书 / 网络恢复时由 book.progress 推脏行）。
+--- 推送单本进度（关书 / 网络恢复时由 book.progress 推脏行）。非 webdav:// 身份没有远端，直接成功。
 ---@param stable_id string
 ---@param pos ProgressPosition
 ---@param cb fun(ok: boolean|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
 function Client:putProgressAsync(stable_id, pos, cb)
     local rel = remoteRelativePath(stable_id)
-    if not rel then defer(cb, nil, _("无效的 WebDAV 书籍路径")); return nil end
+    if not rel then defer(cb, true); return nil end
     return putText(self, progressRemotePath(self, rel), self:webdavCacheRoot() .. "/.progress.upload",
         encodeProgress(pos), cb)
 end
@@ -1992,13 +2045,14 @@ local function posKey(pos)
 end
 
 --- 上传本设备这本书的完整注解快照；别的设备的快照原样保留（语义同 book 服务端 annotations 接口）。
+--- 非 webdav:// 身份没有远端，直接成功。
 ---@param stable_id string
 ---@param annotations table[]
 ---@param cb fun(value: table|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
 function Client:pushNotesAsync(stable_id, annotations, cb)
     local rel = remoteRelativePath(stable_id)
-    if not rel then defer(cb, nil, _("无效的 WebDAV 书籍路径")); return nil end
+    if not rel then defer(cb, {}); return nil end
     local JSON = require("json")
     local device_id = require("utils.settings").ensureDeviceId()
     local cancelled, active = false, nil
@@ -2051,15 +2105,16 @@ end
 
 --- 打开桌面时的自动扫描（节流 AUTO_SCAN_INTERVAL 秒）：扫盘写库 + 清失效。
 ---@param cb fun(scanned: boolean, err: string|nil, skipped: boolean|nil)
+---@param report fun(text: string, done: integer|nil, total: integer|nil)|nil 真实步骤上报
 ---@return { cancel: fun() }|nil
-function Client:autoScanAsync(cb)
+function Client:autoScanAsync(cb, report)
     local path_ok, path_err = self:validatePath()
     if not path_ok then
         cb(false, path_err)
         return nil
     end
     if self:isWebdav() then
-        return self:scanWebdavAsync(cb)
+        return self:scanWebdavAsync(cb, { on_progress = report })
     end
     if not self._auto_scan then
         -- 门闩：窗口内再调返回 nil
@@ -2071,7 +2126,7 @@ function Client:autoScanAsync(cb)
         cb(false, nil, true)
         return nil
     end
-    return scanJob(rootPath(self.cfg), cb)
+    return scanJob(self, cb, report)
 end
 
 --- 封面缓存路径（已存在才返回；绝不现提取，coverRequest 在 UI 线程同步调用）。

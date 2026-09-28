@@ -417,6 +417,56 @@ function BookDB.touchPath(source_id, stable_id, path)
     ) ~= nil
 end
 
+--- 登记了物理路径的行（本地源除外：它的 path 即 stable_id，由扫盘负责）。
+---@param source_id string|string[]
+---@return { source_id: string, stable_id: string, path: string }[]
+function BookDB.pathsBySource(source_id)
+    local where, args = Base.sourceClause("source_id", source_id)
+    local result, nrows = Base.query(
+        "SELECT source_id, stable_id, path FROM books WHERE " .. where
+            .. " AND source_id<>'local' AND path IS NOT NULL AND path<>'';",
+        unpack(args)
+    )
+    local out = {}
+    for i = 1, nrows do
+        out[i] = { source_id = result[1][i], stable_id = result[2][i], path = result[3][i] }
+    end
+    return out
+end
+
+--- 一个事务撤掉失效的路径登记；path 已被改写（校验期间重新下载）的行不动。
+---@param rows { source_id: string, stable_id: string, path: string }[]
+---@return boolean
+function BookDB.clearPaths(rows)
+    if not Base.exec("BEGIN IMMEDIATE;") then return false end
+    for _, row in ipairs(rows) do
+        if not Base.exec(
+            [[UPDATE books SET path=NULL WHERE source_id=? AND stable_id=? AND path=?;]],
+            row.source_id, row.stable_id, row.path
+        ) then
+            Base.exec("ROLLBACK;")
+            return false
+        end
+    end
+    if Base.exec("COMMIT;") then return true end
+    Base.exec("ROLLBACK;")
+    return false
+end
+
+--- 物理路径只属于一个身份：本源已登记的路径，从其他源的行上撤掉。
+--- 用于外部插件共管的文件（如 kindle.koplugin 缓存）先被当成 local 书登记、后归属本源的情况。
+---@param source_id string
+---@return boolean
+function BookDB.releaseForeignPaths(source_id)
+    return Base.exec(
+        [[UPDATE books SET path=NULL
+          WHERE source_id<>? AND path IN
+            (SELECT path FROM books WHERE source_id=? AND path IS NOT NULL);]],
+        source_id,
+        source_id
+    ) ~= nil
+end
+
 --- 手动标记已读/未读。
 --- 已读：read_state=1 且进度抬到 100%（脏写 pending_progress）。
 --- 未读：read_state=2；不回退进度。
@@ -871,6 +921,18 @@ function BookDB.getToc(source_id, stable_id, max_age)
         return nil
     end
     return payload, toc_at
+end
+
+--- 目录缓存条数；未缓存或不是 JSON 数组为 0。封面角标逐本调用，不能解码整份目录。
+---@param source_id string
+---@param stable_id string
+---@return integer
+function BookDB.tocLength(source_id, stable_id)
+    return tonumber(Base.rowexec(
+        [[SELECT CASE WHEN json_valid(toc) THEN json_array_length(toc) ELSE 0 END
+          FROM books WHERE source_id=? AND stable_id=? LIMIT 1;]],
+        source_id, stable_id
+    )) or 0
 end
 
 --- 写入书籍目录缓存。

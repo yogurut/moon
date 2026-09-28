@@ -90,7 +90,7 @@ end
 ---@param cb fun(ok: boolean, err: string|nil)
 ---@return table
 function Source:deleteBookAsync(identity, cb)
-    if self._client:isWebdav() then
+    if Client.isRemote(identity.stable_id) then
         return self._client:deleteWebdavAsync(identity.stable_id, function(ok, err, listed)
             if ok then
                 -- 留墓碑而不是删行：books.sync 没写成时它是脏的，reconcile 不会拿远端旧条目把书复活，
@@ -127,7 +127,7 @@ end
 ---@param cb fun(path: string|nil, err: string|nil)
 ---@return { cancel: fun() }
 function Source:openBookAsync(identity, _opts, cb)
-    if self._client:isWebdav() then
+    if Client.isRemote(identity.stable_id) then
         return self._client:openWebdavAsync(identity.stable_id, function(path, err)
             if not path then cb(nil, err); return end
             local ok, store_err = require("book.store").touch(path, identity)
@@ -185,7 +185,7 @@ function Source:syncBooksAsync(opts, cb)
             if ok == false then cb(nil, err); return end
             cb({ pulled = 1, pushed = 0, hidden = 0, conflicts = 0,
                 skipped = false, scanned = true })
-        end)
+        end, opts.on_progress)
     end
     return self._client:autoScanAsync(function(scanned, err, skipped)
         if err then
@@ -195,7 +195,7 @@ function Source:syncBooksAsync(opts, cb)
         cb({ pulled = scanned and 1 or 0, pushed = 0, hidden = 0, conflicts = 0,
             skipped = skipped == true, reason = skipped and "throttled" or nil,
             scanned = not not scanned })
-    end)
+    end, opts.on_progress)
 end
 
 --- 纯本地目录没有远端：进度域直接 skipped；WebDAV 走通用 book.progress（开书拉取 + 冲突弹窗，关书推脏）。

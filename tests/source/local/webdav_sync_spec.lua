@@ -480,6 +480,37 @@ do
     books = {}
 end
 
+-- 首次同步：远端空（无 books.sync），本地书架已有扫盘登记的书。不下架，但刷新要把本地书传上去并写书目。
+do
+    local L = require("support.config").dir() .. "/webdav-first"
+    Paths.ensureDir(L)
+    local f = assert(io.open(L .. "/首.epub", "wb"))
+    f:write("first")
+    f:close()
+    books[L .. "/首.epub"] = { stable_id = L .. "/首.epub", title = "首", deleted = 0, sync_status = 1 }
+    local dav = fakeDav()
+    local c = Client.new({ webdav_url = "https://dav.example", path = L })
+    c.dav = dav
+
+    Assert.is_true(scan(c))
+    Assert.eq(books[L .. "/首.epub"].deleted, 0, "日常同步不因远端空而下架")
+    Assert.is_nil(dav.files[SYNC], "日常同步没东西可写")
+
+    local steps = {}
+    Assert.is_true(run(c, { refresh = true, on_progress = function(text, done, total)
+        steps[#steps + 1] = table.concat({ text, done or "", total or "" }, "|")
+    end }))
+    Assert.eq(dav.files[ROOT .. "/首.epub"].data, "first")
+    Assert.eq(remoteEntries(dav)["首.epub"].bookName, "首")
+    Assert.contains(steps, "正在检查远端目录…||")
+    Assert.contains(steps, "正在上传 首.epub|1|1", "上传逐本计数")
+    Assert.contains(steps, "正在更新书目（1 本）||")
+    Assert.eq(books["webdav://首.epub"].deleted, 0)
+    Assert.eq(books["webdav://首.epub"].path, L .. "/首.epub")
+    os.remove(L .. "/首.epub")
+    books = {}
+end
+
 -- 删除：书文件、封面/进度/笔记边车、书目条目一起删；书文件本来就没了（404）也算删成功。
 do
     local dav = fakeDav()
